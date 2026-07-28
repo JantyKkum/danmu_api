@@ -5,7 +5,7 @@ import { httpGet, buildQueryString } from "../utils/http-util.js";
 import { convertToAsciiSum } from "../utils/codec-util.js";
 import { generateValidStartDate } from "../utils/time-util.js";
 import { addAnime, removeEarliestAnime } from "../utils/cache-util.js";
-import { printFirst200Chars, titleMatches } from "../utils/common-util.js";
+import { printFirst200Chars, titleMatches, getExplicitSeasonNumber, extractSeasonNumberFromAnimeTitle } from "../utils/common-util.js";
 import { SegmentListResponse } from '../models/dandan-model.js';
 
 // =====================
@@ -82,7 +82,7 @@ export default class SohuSource extends BaseSource {
 
   async search(keyword) {
     try {
-      log("info", `[Sohu] 开始搜索: ${keyword}`);
+      log("info", `[sohu] 开始搜索: ${keyword}`);
 
       // 构造搜索URL
       const params = {
@@ -118,14 +118,14 @@ export default class SohuSource extends BaseSource {
       const response = await httpGet(searchUrl, { headers });
 
       if (!response || !response.data) {
-        log("info", "[Sohu] 搜索响应为空");
+        log("info", "[sohu] 搜索响应为空");
         return [];
       }
 
       const data = typeof response.data === "string" ? JSON.parse(response.data) : response.data;
 
       if (!data.data || !data.data.items) {
-        log("info", "[Sohu] 搜索响应中无数据");
+        log("info", "[sohu] 搜索响应中无数据");
         return [];
       }
 
@@ -138,63 +138,64 @@ export default class SohuSource extends BaseSource {
         }
       }
 
-      log("info", `[Sohu] 搜索找到 ${results.length} 个有效结果`);
+      log("info", `[sohu] 搜索找到 ${results.length} 个有效结果`);
       return results;
 
     } catch (error) {
-      log("error", "[Sohu] 搜索出错:", error.message);
+      log("error", "[sohu] 搜索出错:", error.message);
       return [];
     }
   }
 
+  async getPlaylistData(id) {
+    const params = {
+      'playlistid': id,
+      'api_key': "f351515304020cad28c92f70f002261c"
+    };
+
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Referer': 'https://tv.sohu.com/'
+    };
+
+    const playlistUrl = `https://pl.hd.sohu.com/videolist?${buildQueryString(params)}`;
+    const response = await httpGet(playlistUrl, { headers, timeout: 15000 });
+
+    if (!response || !response.data) {
+      return null;
+    }
+
+    let data = response.data;
+    if (typeof data === "string" && data.startsWith('jsonp')) {
+      const start = data.indexOf('(') + 1;
+      const end = data.lastIndexOf(')');
+      if (start > 0 && end > start) {
+        data = JSON.parse(data.substring(start, end));
+      } else {
+        log("error", "[sohu] 搜狐视频: 无法解析JSONP响应");
+        return null;
+      }
+    } else if (typeof data === "string") {
+      data = JSON.parse(data);
+    }
+
+    return data;
+  }
+
   async getEpisodes(id) {
     try {
-      log("info", `[Sohu] 获取分集列表: media_id=${id}`);
+      log("info", `[sohu] 获取分集列表: media_id=${id}`);
 
-      let videosData = null;
-
-      const params = {
-        'playlistid': id,
-        'api_key': "f351515304020cad28c92f70f002261c"
-      };
-
-      const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://tv.sohu.com/'
-      };
-
-      const playlistUrl = `https://pl.hd.sohu.com/videolist?${buildQueryString(params)}`;
-
-      const response = await httpGet(playlistUrl, { headers, timeout: 15000 });
-
-      if (!response || !response.data) {
-        log("info", "[Sohu] 分集响应为空");
+      const data = await this.getPlaylistData(id);
+      if (!data) {
+        log("info", "[sohu] 分集响应为空");
         return [];
       }
 
-      let data = response.data;
-
-      // 解析JSONP响应
-      if (typeof data === "string" && data.startsWith('jsonp')) {
-        // 提取括号内的JSON
-        const start = data.indexOf('(') + 1;
-        const end = data.lastIndexOf(')');
-        if (start > 0 && end > start) {
-          const jsonStr = data.substring(start, end);
-          data = JSON.parse(jsonStr);
-        } else {
-          log("error", "搜狐视频: 无法解析JSONP响应");
-          return [];
-        }
-      } else if (typeof data === "string") {
-        data = JSON.parse(data);
-      }
-
-      // 提取视频列表
-      videosData = data.videos || [];
+      const videosData = data.videos || [];
 
       if (!videosData || videosData.length === 0) {
-        log("warning", `搜狐视频: 未找到分集列表 (media_id=${id})`);
+        log("warn", `[sohu] 搜狐视频: 未找到分集列表 (media_id=${id})`);
         return [];
       }
 
@@ -230,28 +231,54 @@ export default class SohuSource extends BaseSource {
         episodes.push(episode);
       }
 
-      log("info", `[Sohu] 成功获取 ${episodes.length} 个分集 (media_id=${id})`);
+      log("info", `[sohu] 成功获取 ${episodes.length} 个分集 (media_id=${id})`);
       return episodes;
 
     } catch (error) {
-      log("error", "[Sohu] 获取分集出错:", error.message);
+      log("error", "[sohu] 获取分集出错:", error.message);
       return [];
     }
   }
 
-  async handleAnimes(sourceAnimes, queryTitle, curAnimes) {
+  /**
+   * 处理搜索结果
+   * @param {Array} sourceAnimes 原始数据
+   * @param {string} queryTitle 关键词
+   * @param {Array} curAnimes 结果池
+   * @param {Map|null} detailStore 详情缓存
+   * @param {number|null} querySeason 目标季度
+   */
+  async handleAnimes(sourceAnimes, queryTitle, curAnimes, detailStore = null, querySeason = null) {
     const tmpAnimes = [];
 
     // 添加错误处理，确保sourceAnimes是数组
     if (!sourceAnimes || !Array.isArray(sourceAnimes)) {
-      log("error", "[Sohu] sourceAnimes is not a valid array");
+      log("error", "[sohu] sourceAnimes is not a valid array");
       return [];
     }
 
+    // 基础标题与季度匹配过滤
+    let filteredAnimes = sourceAnimes.filter(s => titleMatches(s.title, queryTitle, querySeason));
+
+    // 提取搜索词中的明确季度信息或使用传入的季度参数
+    const resolvedQuerySeason = querySeason !== null ? querySeason : getExplicitSeasonNumber(queryTitle);
+
+    // 初始列表预过滤机制：若用户指定了季度，优先检查结果中是否已包含匹配项
+    if (resolvedQuerySeason !== null) {
+      const seasonFiltered = filteredAnimes.filter(anime => {
+        const s = extractSeasonNumberFromAnimeTitle(anime.title).season;
+        return s === resolvedQuerySeason || (resolvedQuerySeason === 1 && s === null);
+      });
+
+      // 如果已命中目标，减少详情请求量
+      if (seasonFiltered.length > 0) {
+        filteredAnimes = seasonFiltered;
+        log("info", `[sohu] 结果已命中目标季(第${resolvedQuerySeason}季)，跳过非目标季相关请求`);
+      }
+    }
+
     // 使用 map 和 async 时需要返回 Promise 数组，并等待所有 Promise 完成
-    const processSohuAnimes = await Promise.all(sourceAnimes
-      .filter(s => titleMatches(s.title, queryTitle))
-      .map(async (anime) => {
+    const processSohuAnimes = await Promise.all(filteredAnimes.map(async (anime) => {
         try {
           const eps = await this.getEpisodes(anime.mediaId);
           let links = [];
@@ -287,12 +314,12 @@ export default class SohuSource extends BaseSource {
 
             tmpAnimes.push(transformedAnime);
 
-            addAnime({...transformedAnime, links: links});
+            addAnime({...transformedAnime, links: links}, detailStore);
 
             if (globals.animes.length > globals.MAX_ANIMES) removeEarliestAnime();
           }
         } catch (error) {
-          log("error", `[Sohu] Error processing anime: ${error.message}`);
+          log("error", `[sohu] Error processing anime: ${error.message}`);
         }
       })
     );
@@ -300,6 +327,23 @@ export default class SohuSource extends BaseSource {
     this.sortAndPushAnimesByYear(tmpAnimes, curAnimes);
 
     return processSohuAnimes;
+  }
+
+  async getEpisodeDuration(aid, vid) {
+    if (!aid) return 0;
+
+    try {
+      const data = await this.getPlaylistData(aid);
+      const videos = Array.isArray(data?.videos) ? data.videos : [];
+      if (!videos.length) return 0;
+
+      const matchedVideo = videos.find(video => String(video?.vid || '') === String(vid || '')) || (videos.length === 1 ? videos[0] : null);
+      const duration = Number(matchedVideo?.playLength || 0);
+      return Number.isFinite(duration) && duration > 0 ? duration : 0;
+    } catch (error) {
+      log("warn", `[sohu] 获取真实时长失败: ${error.message}`);
+      return 0;
+    }
   }
 
   // 提取vid和aid的公共函数
@@ -330,7 +374,7 @@ export default class SohuSource extends BaseSource {
   }
 
   async getEpisodeDanmu(id) {
-    log("info", "开始从本地请求搜狐视频弹幕...", id);
+    log("info", "[sohu] 开始从本地请求搜狐视频弹幕...", id);
 
     // 获取弹幕分段数据
     const segmentResult = await this.getEpisodeDanmuSegments(id);
@@ -339,7 +383,7 @@ export default class SohuSource extends BaseSource {
     }
 
     const segmentList = segmentResult.segmentList;
-    log("info", `弹幕分段数量: ${segmentList.length}`);
+    log("info", `[sohu] 弹幕分段数量: ${segmentList.length}`);
 
     // 并发请求所有弹幕段，限制并发数量为5
     const MAX_CONCURRENT = 10;
@@ -371,7 +415,7 @@ export default class SohuSource extends BaseSource {
             break;
           }
         } else {
-          log("error", `获取弹幕段失败 (${start}-${end}s):`, result.reason.message);
+          log("error", `[sohu] 获取弹幕段失败 (${start}-${end}s):`, result.reason.message);
         }
       }
       
@@ -382,7 +426,7 @@ export default class SohuSource extends BaseSource {
     }
 
     if (allComments.length === 0) {
-      log("info", `搜狐视频: 该视频暂无弹幕数据 (vid=${id})`);
+      log("info", `[sohu] 搜狐视频: 该视频暂无弹幕数据 (vid=${id})`);
       return [];
     }
 
@@ -401,7 +445,7 @@ export default class SohuSource extends BaseSource {
       const response = await httpGet(segment.url, { headers, timeout: 10000 });
 
       if (!response || !response.data) {
-        log("error", `搜狐视频: 弹幕段响应为空 (${segment.segment_start}-${segment.segment_end}s)`);
+        log("error", `[sohu] 搜狐视频: 弹幕段响应为空 (${segment.segment_start}-${segment.segment_end}s)`);
         return [];
       }
 
@@ -410,33 +454,33 @@ export default class SohuSource extends BaseSource {
         const comments = data.info?.comments || [];
 
         if (comments && comments.length > 0) {
-          log("info", `搜狐视频: 获取到 ${comments.length} 条弹幕 (${segment.segment_start}-${segment.segment_end}s)`);
+          log("info", `[sohu] 搜狐视频: 获取到 ${comments.length} 条弹幕 (${segment.segment_start}-${segment.segment_end}s)`);
         }
 
         return comments || [];
       } catch (error) {
-        log("error", `搜狐视频: 解析弹幕响应失败: ${error.message}`);
+        log("error", `[sohu] 搜狐视频: 解析弹幕响应失败: ${error.message}`);
         return [];
       }
     } catch (error) {
-      log("error", `搜狐视频: 获取弹幕段失败 (vid=${vid}, ${start}-${end}s): ${error.message}`);
+      log("error", `[sohu] 搜狐视频: 获取弹幕段失败 (vid=${vid}, ${start}-${end}s): ${error.message}`);
       return [];
     }
   }
 
   async getEpisodeDanmuSegments(id) {
-    log("info", "获取搜狐视频弹幕分段列表...", id);
+    log("info", "[sohu] 获取搜狐视频弹幕分段列表...", id);
 
     // 解析 episode_id
     const { vid, aid } = await this.extractVidAndAid(id);
 
-    // 搜狐视频的弹幕分段逻辑，使用固定的最大时间
-    const maxTime = 10800;
+    const duration = await this.getEpisodeDuration(aid, vid);
+    const maxTime = duration > 0 ? Math.ceil(duration) : 10800;
     const segmentDuration = 300; // 300秒一段
     const segments = [];
 
     for (let start = 0; start < maxTime; start += segmentDuration) {
-      const end = start + segmentDuration;
+      const end = Math.min(start + segmentDuration, maxTime);
       segments.push({
         "type": "sohu",
         "segment_start": start,
@@ -447,6 +491,7 @@ export default class SohuSource extends BaseSource {
 
     return new SegmentListResponse({
       "type": "sohu",
+      "duration": duration > 0 ? duration : 0,
       "segmentList": segments
     });
   }
@@ -470,7 +515,7 @@ export default class SohuSource extends BaseSource {
 
       return contents;
     } catch (error) {
-      log("error", "请求分片弹幕失败:", error);
+      log("error", "[sohu] 请求分片弹幕失败:", error);
       return [];
     }
   }
@@ -512,10 +557,11 @@ export default class SohuSource extends BaseSource {
           cid: String(danmuId),
           p: pString,
           m: comment.c || '',
-          t: parseFloat(vtime)
+          t: parseFloat(vtime),
+          like: comment.fcount
         };
       } catch (error) {
-        log("error", `格式化弹幕失败: ${error.message}, 弹幕数据:`, comment);
+        log("error", `[sohu] 格式化弹幕失败: ${error.message}, 弹幕数据:`, comment);
         return null;
       }
     }).filter(comment => comment !== null);

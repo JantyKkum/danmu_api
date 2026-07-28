@@ -180,6 +180,8 @@ function loadEnvVariables() {
             
             // 使用从API获取的原始环境变量，用于系统设置
             const originalEnvVars = config.originalEnvVars || {};
+            // 浏览器偏好覆盖部署环境变量；云函数更新变量通常要等重新部署后才会进入新实例。
+            applyTheme(getStoredTheme() || originalEnvVars.UI_THEME || document.body.dataset.theme || 'ocean');
             
             // 重新组织数据结构以适配现有UI
             envVariables = {};
@@ -204,7 +206,8 @@ function loadEnvVariables() {
                     type: varConfig.type || 'text',
                     min: varConfig.min,
                     max: varConfig.max,
-                    options: varConfig.options || [] // 仅对 select 和 multi-select 类型有效
+                    options: varConfig.options || [], // 仅对 select 和 multi-select 类型有效
+                    sources: varConfig.sources || null // 仅对 DANMU_OFFSET 等需要来源配置的有效
                 });
             });
             

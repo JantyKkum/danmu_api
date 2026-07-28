@@ -3,6 +3,7 @@ import { baseCssContent } from "./css/base.css.js";
 import { componentsCssContent } from "./css/components.css.js";
 import { formsCssContent } from "./css/forms.css.js";
 import { responsiveCssContent } from "./css/responsive.css.js";
+import { themesCssContent } from "./css/themes.css.js";
 import { mainJsContent } from "./js/main.js";
 import { previewJsContent } from "./js/preview.js";
 import { logviewJsContent } from "./js/logview.js";
@@ -25,9 +26,19 @@ export const HTML_TEMPLATE = /* html */ `
     <style>${componentsCssContent}</style>
     <style>${formsCssContent}</style>
     <style>${responsiveCssContent}</style>
+    <style>${themesCssContent}</style>
     
 </head>
-<body>
+<body data-theme="globals.uiTheme">
+    <script>
+        try {
+            const storedTheme = localStorage.getItem('logvar_ui_theme');
+            const supportedThemes = ['ocean', 'forest', 'graphite', 'berry', 'monochrome', 'sunset', 'aurora', 'lavender', 'mist', 'terminal'];
+            if (supportedThemes.includes(storedTheme)) document.body.dataset.theme = storedTheme;
+        } catch (error) {
+            // localStorage may be unavailable in restricted browser contexts.
+        }
+    </script>
     <div class="container">
         <!-- 进度条 -->
         <div class="progress-container" id="progress-container">
@@ -97,30 +108,68 @@ export const HTML_TEMPLATE = /* html */ `
             <!-- 接口调试 -->
             <div class="section" id="api-section">
                 <h2>接口调试</h2>
-                <div class="api-selector">
-                    <div class="form-group">
-                        <label>选择接口</label>
-                        <select id="api-select" onchange="loadApiParams()">
-                            <option value="">-- 请选择接口 --</option>
-                            <option value="searchAnime">搜索动漫 - /api/v2/search/anime</option>
-                            <option value="searchEpisodes">搜索剧集 - /api/v2/search/episodes</option>
-                            <option value="matchAnime">匹配动漫 - /api/v2/match</option>
-                            <option value="getBangumi">获取番剧详情 - /api/v2/bangumi/:animeId</option>
-                            <option value="getComment">获取弹幕 - /api/v2/comment/:commentId</option>
-                            <option value="getSegmentComment">获取分片弹幕 - /api/v2/segmentcomment</option>
-                        </select>
+                <div class="api-top-tabs">
+                    <button class="api-top-tab active" onclick="switchApiTopTab('debug', event)">接口调试</button>
+                    <button class="api-top-tab" onclick="switchApiTopTab('danmu-test', event)">弹幕测试</button>
+                </div>
+
+                <div class="api-tab-content active" id="api-debug-content">
+                    <div class="api-selector">
+                        <div class="form-group">
+                            <label>选择接口</label>
+                            <select id="api-select" onchange="loadApiParams()">
+                                <option value="">-- 请选择接口 --</option>
+                                <option value="searchAnime">搜索动漫 - /api/v2/search/anime</option>
+                                <option value="searchEpisodes">搜索剧集 - /api/v2/search/episodes</option>
+                                <option value="matchAnime">匹配动漫 - /api/v2/match</option>
+                                <option value="getBangumi">获取番剧详情 - /api/v2/bangumi/:animeId</option>
+                                <option value="getComment">获取弹幕 - /api/v2/comment/:commentId</option>
+                                <option value="getSegmentComment">获取分片弹幕 - /api/v2/segmentcomment</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="api-params" id="api-params" style="display: none;">
+                        <h3 style="margin-bottom: 15px;">接口参数</h3>
+                        <div id="params-form"></div>
+                        <button class="btn btn-success" onclick="testApi()">发送请求</button>
+                    </div>
+                    <div id="api-response-container" style="display: none;">
+                        <h3 style="margin: 20px 0 10px;">响应结果</h3>
+                        <div class="api-response" id="api-response"></div>
                     </div>
                 </div>
 
-                <div class="api-params" id="api-params" style="display: none;">
-                    <h3 style="margin-bottom: 15px;">接口参数</h3>
-                    <div id="params-form"></div>
-                    <button class="btn btn-success" onclick="testApi()">发送请求</button>
-                </div>
+                <div class="api-tab-content" id="danmu-test-content">
+                    <div class="danmu-test-tabs">
+                        <button class="danmu-test-tab active" onclick="switchDanmuTestTab('auto', event)">自动匹配测试</button>
+                        <button class="danmu-test-tab" onclick="switchDanmuTestTab('manual', event)">手动匹配测试</button>
+                    </div>
 
-                <div id="api-response-container" style="display: none;">
-                    <h3 style="margin: 20px 0 10px;">响应结果</h3>
-                    <div class="api-response" id="api-response"></div>
+                    <div class="danmu-test-panel active" id="auto-match-panel">
+                        <p style="color: #666; margin-bottom: 15px;">模拟播放器自动匹配流程：输入文件名 → 匹配剧集 → 获取弹幕</p>
+                        <div class="form-group" style="margin-bottom: 15px;">
+                            <label>文件名</label>
+                            <div style="display:flex;gap:10px;margin-top:5px;">
+                                <input type="text" id="auto-match-filename" placeholder="示例: 生万物 S02E08, 无忧渡.S02E08.2160p.WEB-DL" style="flex:1;">
+                                <button class="btn btn-success" id="auto-match-btn" onclick="autoMatchTest()">开始匹配</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="danmu-test-panel" id="manual-match-panel">
+                        <p style="color: #666; margin-bottom: 15px;">模拟播放器手动搜索流程：搜索动漫 → 选择番剧 → 选择剧集 → 获取弹幕</p>
+                        <div class="form-group" style="margin-bottom: 15px;">
+                            <label>搜索关键字</label>
+                            <div style="display:flex;gap:10px;margin-top:5px;">
+                                <input type="text" id="manual-search-keyword" placeholder="请输入动漫名称" style="flex:1;">
+                                <button class="btn btn-primary" id="manual-search-btn" onclick="manualSearchAnime()">搜索</button>
+                            </div>
+                        </div>
+                        <div id="manual-anime-list" style="display:none;"></div>
+                        <div id="manual-episode-list" style="display:none;"></div>
+                    </div>
+
+                    <div id="danmu-result-area" style="display:none;"></div>
                 </div>
             </div>
 
@@ -164,8 +213,15 @@ export const HTML_TEMPLATE = /* html */ `
                     <div>
                         <h2 style="margin: 0;">环境变量配置</h2>
                         <p style="margin: 5px 0 0 0; color: #666; font-size: 0.9em;">vercel/netlify/edgeone平台修改变量后需要重新部署</p>
-                    </div>
+                </div>
                 <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                    <button class="btn btn-primary config-transfer-btn" onclick="exportSystemConfig()" title="下载当前环境变量配置文件">
+                        <span class="config-transfer-icon" aria-hidden="true">📤</span> 导出配置
+                    </button>
+                    <button class="btn btn-primary config-transfer-btn" onclick="triggerConfigImport()" title="上传 JSON 文件并导入环境变量配置">
+                        <span class="config-transfer-icon" aria-hidden="true">📥</span> 导入配置
+                    </button>
+                    <input type="file" id="config-import-file" accept=".json,application/json" style="display: none;" onchange="importSystemConfigFile(this.files[0])">
                     <button class="btn btn-danger" onclick="showClearCacheModal()" title="清理系统缓存">
                         🗑️ 清理缓存
                     </button>
@@ -188,6 +244,7 @@ export const HTML_TEMPLATE = /* html */ `
                                 <li>剧集ID缓存 (episodeIds)</li>
                                 <li>剧集编号缓存 (episodeNum)</li>
                                 <li>最后选择映射缓存 (lastSelectMap)</li>
+                                <li>动画元数据缓存 (Bangumi Data)</li>
                                 <li>搜索结果缓存</li>
                                 <li>弹幕内容缓存</li>
                                 <li>请求历史记录</li>
@@ -235,6 +292,45 @@ export const HTML_TEMPLATE = /* html */ `
                     <button class="category-btn" onclick="switchCategory('danmu', event)">🔣 弹幕配置</button>
                     <button class="category-btn" onclick="switchCategory('cache', event)">💾 缓存配置</button>
                     <button class="category-btn" onclick="switchCategory('system', event)">⚙️ 系统配置</button>
+                </div>
+
+                <div class="theme-settings" id="theme-settings" hidden>
+                    <div class="theme-settings-copy">
+                        <h3>界面主题</h3>
+                        <span class="theme-current-label" id="theme-current-label">UI_THEME · 海湾蓝</span>
+                    </div>
+                    <div class="theme-options" role="radiogroup" aria-label="界面主题选择">
+                        <button type="button" role="radio" class="theme-option" data-theme-option="ocean" aria-checked="false" onclick="selectTheme('ocean')" title="海湾蓝">
+                            <span class="theme-swatches" aria-hidden="true"><i style="background: #145b6f"></i><i style="background: #159b8f"></i><i style="background: #dfe9f1"></i></span><span class="theme-option-label">海湾蓝</span>
+                        </button>
+                        <button type="button" role="radio" class="theme-option" data-theme-option="forest" aria-checked="false" onclick="selectTheme('forest')" title="森林绿">
+                            <span class="theme-swatches" aria-hidden="true"><i style="background: #245c45"></i><i style="background: #b36a3c"></i><i style="background: #e5eee8"></i></span><span class="theme-option-label">森林绿</span>
+                        </button>
+                        <button type="button" role="radio" class="theme-option" data-theme-option="graphite" aria-checked="false" onclick="selectTheme('graphite')" title="石墨夜">
+                            <span class="theme-swatches" aria-hidden="true"><i style="background: #0e1115"></i><i style="background: #55b8c9"></i><i style="background: #20242a"></i></span><span class="theme-option-label">石墨夜</span>
+                        </button>
+                        <button type="button" role="radio" class="theme-option" data-theme-option="berry" aria-checked="false" onclick="selectTheme('berry')" title="莓果红">
+                            <span class="theme-swatches" aria-hidden="true"><i style="background: #702846"></i><i style="background: #315b8a"></i><i style="background: #f1e5eb"></i></span><span class="theme-option-label">莓果红</span>
+                        </button>
+                        <button type="button" role="radio" class="theme-option" data-theme-option="monochrome" aria-checked="false" onclick="selectTheme('monochrome')" title="黑白简约">
+                            <span class="theme-swatches" aria-hidden="true"><i style="background: #111111"></i><i style="background: #767676"></i><i style="background: #f2f2f2"></i></span><span class="theme-option-label">黑白简约</span>
+                        </button>
+                        <button type="button" role="radio" class="theme-option" data-theme-option="sunset" aria-checked="false" onclick="selectTheme('sunset')" title="暖霞橙">
+                            <span class="theme-swatches" aria-hidden="true"><i style="background: #4d344b"></i><i style="background: #b54132"></i><i style="background: #ebeef2"></i></span><span class="theme-option-label">暖霞橙</span>
+                        </button>
+                        <button type="button" role="radio" class="theme-option" data-theme-option="aurora" aria-checked="false" onclick="selectTheme('aurora')" title="极光青">
+                            <span class="theme-swatches" aria-hidden="true"><i style="background: #164a4a"></i><i style="background: #d49a3a"></i><i style="background: #dfe8e6"></i></span><span class="theme-option-label">极光青</span>
+                        </button>
+                        <button type="button" role="radio" class="theme-option" data-theme-option="lavender" aria-checked="false" onclick="selectTheme('lavender')" title="薰衣紫">
+                            <span class="theme-swatches" aria-hidden="true"><i style="background: #4c3e69"></i><i style="background: #3f806b"></i><i style="background: #ebe9f0"></i></span><span class="theme-option-label">薰衣紫</span>
+                        </button>
+                        <button type="button" role="radio" class="theme-option" data-theme-option="mist" aria-checked="false" onclick="selectTheme('mist')" title="晨雾灰">
+                            <span class="theme-swatches" aria-hidden="true"><i style="background: #40566b"></i><i style="background: #a94f42"></i><i style="background: #e7ebef"></i></span><span class="theme-option-label">晨雾灰</span>
+                        </button>
+                        <button type="button" role="radio" class="theme-option" data-theme-option="terminal" aria-checked="false" onclick="selectTheme('terminal')" title="终端绿">
+                            <span class="theme-swatches" aria-hidden="true"><i style="background: #050706"></i><i style="background: #4faf75"></i><i style="background: #1d231f"></i></span><span class="theme-option-label">终端绿</span>
+                        </button>
+                    </div>
                 </div>
 
                 <div class="env-list" id="env-list"></div>
@@ -303,9 +399,10 @@ export const HTML_TEMPLATE = /* html */ `
     <!-- 项目声明 -->
     <footer class="footer">
         <p class="footer-text">
-            一个人人都能部署的基于 js 的弹幕 API 服务器，支持爱优腾芒哔咪人韩巴狐乐西弹幕直接获取，兼容弹弹play的搜索、详情查询和弹幕获取接口规范，并提供日志记录，支持vercel/netlify/edgeone/cloudflare/docker/claw等部署方式，不用提前下载弹幕，没有nas或小鸡也能一键部署。
+            一个人人都能部署的基于 js 的弹幕 API 服务器，支持爱优腾芒哔咪人韩巴狐乐西埋帆红弹幕直接获取，兼容弹弹play的搜索、详情查询和弹幕获取接口规范，并提供日志记录，支持vercel/netlify/edgeone/cloudflare/docker/hf等部署方式，不用提前下载弹幕，没有nas或小鸡也能一键部署。
         </p>
-        <p class="footer-text">本项目仅为个人爱好开发，代码开源。如有任何侵权行为，请联系本人删除。</p>
+        <p class="footer-text">本项目仅为个人学习爱好开发，代码开源。如有任何侵权行为，请联系本人删除。</p>
+        <p class="footer-text">本项目完全免费，不收取任何费用，请勿上当受骗。</p>
         <p class="footer-links">
             <a href="https://t.me/ddjdd_bot" target="_blank" class="footer-link">💬 TG MSG ROBOT</a>
             <a href="https://t.me/logvar_danmu_group" target="_blank" class="footer-link">👥 TG GROUP</a>

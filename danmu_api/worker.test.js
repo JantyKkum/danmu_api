@@ -5,8 +5,9 @@ dotenv.config();
 import test from 'node:test';
 import assert from 'node:assert';
 import { handleRequest } from './worker.js';
-import { extractTitleSeasonEpisode, getBangumi, getComment, searchAnime } from "./apis/dandan-api.js";
+import { extractTitleSeasonEpisode, getBangumi, getComment, getCommentByUrl, matchAnime, searchAnime, buildSearchAnimeUrl } from "./apis/dandan-api.js";
 import { getRedisKey, pingRedis, setRedisKey, setRedisKeyWithExpiry } from "./utils/redis-util.js";
+import { getLocalRedisKey, setLocalRedisKey, setLocalRedisKeyWithExpiry } from "./utils/local-redis-util.js";
 import { getImdbepisodes } from "./utils/imdb-util.js";
 import { getTMDBChineseTitle, getTmdbJpDetail, searchTmdbTitles } from "./utils/tmdb-util.js";
 import { getDoubanDetail, getDoubanInfoByImdbId, searchDoubanTitles } from "./utils/douban-util.js";
@@ -24,6 +25,8 @@ import SohuSource from "./sources/sohu.js";
 import LeshiSource from "./sources/leshi.js";
 import XiguaSource from "./sources/xigua.js";
 import MaiduiduiSource from "./sources/maiduidui.js";
+import AiyifanSource from "./sources/aiyifan.js";
+import HongguoSource, { parseHongguoPlayerUrl } from "./sources/hongguo.js";
 import AnimekoSource from "./sources/animeko.js";
 import OtherSource from "./sources/other.js";
 import { NodeHandler } from "./configs/handlers/node-handler.js";
@@ -31,7 +34,14 @@ import { VercelHandler } from "./configs/handlers/vercel-handler.js";
 import { NetlifyHandler } from "./configs/handlers/netlify-handler.js";
 import { CloudflareHandler } from "./configs/handlers/cloudflare-handler.js";
 import { EdgeoneHandler } from "./configs/handlers/edgeone-handler.js";
-import { Segment } from "./models/dandan-model.js"
+import { HuggingfaceHandler } from "./configs/handlers/huggingface-handler.js";
+import { HandlerFactory } from "./configs/handlers/handler-factory.js";
+import { Globals } from "./configs/globals.js";
+import { addAnime, addEpisode } from "./utils/cache-util.js";
+import { convertToAsciiSum } from "./utils/codec-util.js";
+import { handleDanmusLike } from "./utils/danmu-util.js";
+import { Segment, SegmentListResponse } from "./models/dandan-model.js"
+import { initBangumiData, searchBangumiData, clearBangumiDataCache } from "./utils/bangumi-data-util.js";
 
 // Mock Request class for testing
 class MockRequest {
@@ -53,6 +63,55 @@ async function parseResponse(response) {
   }
 }
 
+function mockJsonResponse(data, url) {
+  return {
+    ok: true,
+    status: 200,
+    url,
+    headers: new Headers({ 'content-type': 'application/json' }),
+    text: async () => JSON.stringify(data),
+  };
+}
+
+async function withMockFetch(mockFetch, run) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = mockFetch;
+  try {
+    return await run();
+  } finally {
+    if (originalFetch === undefined) delete globalThis.fetch;
+    else globalThis.fetch = originalFetch;
+  }
+}
+
+function createSearchResult(anime) {
+  return {
+    animeId: anime.animeId,
+    bangumiId: anime.bangumiId,
+    animeTitle: anime.animeTitle,
+    type: anime.type,
+    typeDescription: anime.typeDescription,
+    imageUrl: anime.imageUrl,
+    startDate: anime.startDate,
+    episodeCount: anime.episodeCount,
+    rating: anime.rating,
+    isFavorited: anime.isFavorited,
+    source: anime.source
+  };
+}
+
+function resetSearchState() {
+  Globals.init({});
+  Globals.animes = [];
+  Globals.episodeIds = [];
+  Globals.episodeNum = 10001;
+  Globals.searchCache = new Map();
+  Globals.commentCache = new Map();
+  Globals.requestHistory = new Map();
+  Globals.envs.rateLimitMaxRequests = 0;
+  delete Globals.requestAnimeDetailsMap;
+}
+
 const urlPrefix = "http://localhost:9321";
 const token = "87654321";
 
@@ -70,6 +129,8 @@ test('worker.js API endpoints', async (t) => {
   const leshiSource = new LeshiSource();
   const xiguaSource = new XiguaSource();
   const maiduiduiSource = new MaiduiduiSource();
+  const aiyifanSource = new AiyifanSource();
+  const hongguoSource = new HongguoSource();
   const animekoSource = new AnimekoSource();
   const otherSource = new OtherSource();
 
@@ -79,6 +140,91 @@ test('worker.js API endpoints', async (t) => {
     const body = await parseResponse(res);
 
     assert.equal(res.status, 200);
+  });
+
+  await t.test('HandlerFactory should support Hugging Face Spaces', async () => {
+    const handler = await HandlerFactory.getHandler('huggingface');
+
+    assert(handler instanceof HuggingfaceHandler);
+    assert(HandlerFactory.getSupportedPlatforms().includes('huggingface'));
+  });
+
+  await t.test('HuggingfaceHandler should call Space variables and restart APIs', async () => {
+    const env = {
+      DEPLOY_PLATFROM_ACCOUNT: 'hf-user',
+      DEPLOY_PLATFROM_PROJECT: 'hf-space',
+      DEPLOY_PLATFROM_TOKEN: 'hf-token'
+    };
+    Globals.init(env);
+    const globals = Globals.getConfig();
+    const handler = new HuggingfaceHandler();
+
+    await withMockFetch(async (url, options) => {
+      if (url === 'https://huggingface.co/api/spaces/hf-user/hf-space/variables' && options.method === 'POST') {
+        assert.equal(options.headers.Authorization, 'Bearer hf-token');
+        assert.deepEqual(JSON.parse(options.body), { key: 'DANMU_LIMIT', value: '1' });
+        return mockJsonResponse({}, url);
+      }
+      if (url === 'https://huggingface.co/api/spaces/hf-user/hf-space/variables' && options.method === 'DELETE') {
+        assert.equal(options.headers.Authorization, 'Bearer hf-token');
+        assert.deepEqual(JSON.parse(options.body), { key: 'DANMU_LIMIT' });
+        return mockJsonResponse({}, url);
+      }
+      if (url === 'https://huggingface.co/api/spaces/hf-user/hf-space/restart' && options.method === 'POST') {
+        assert.equal(options.headers.Authorization, 'Bearer hf-token');
+        return mockJsonResponse({}, url);
+      }
+      throw new Error(`Unexpected request: ${options.method} ${url}`);
+    }, async () => {
+      assert.equal(await handler.setEnv('DANMU_LIMIT', 1), true);
+      assert.equal(globals.env.DANMU_LIMIT, 1);
+      assert.equal(await handler.delEnv('DANMU_LIMIT'), true);
+      assert.equal(await handler.deploy(), true);
+    });
+  });
+
+  await t.test('BilibiliSource should resolve b23.tv short links from redirect location', async () => {
+    Globals.init({});
+    const source = new BilibiliSource();
+    const shortUrl = 'https://b23.tv/BV1GJ411x7h7';
+    const targetUrl = 'https://www.bilibili.com/video/BV1GJ411x7h7';
+    let seenRedirectMode;
+
+    await withMockFetch(async (url, options) => {
+      assert.equal(url, shortUrl);
+      seenRedirectMode = options.redirect;
+      return {
+        ok: false,
+        status: 302,
+        url: shortUrl,
+        headers: new Headers({ location: targetUrl }),
+        text: async () => '',
+      };
+    }, async () => {
+      const resolvedUrl = await source.resolveB23Link(shortUrl);
+      assert.equal(resolvedUrl, targetUrl);
+    });
+
+    assert.equal(seenRedirectMode, 'manual');
+  });
+
+  await t.test('buildSearchAnimeUrl should preserve special characters in keyword', async () => {
+    const searchUrl = buildSearchAnimeUrl(`${urlPrefix}/api/v2/match`, 'Love & Death', 1, 2);
+
+    assert.equal(searchUrl.pathname, '/api/v2/search/anime');
+    assert.equal(searchUrl.searchParams.get('keyword'), 'Love & Death');
+    assert.equal(searchUrl.searchParams.get('season'), '1');
+    assert.equal(searchUrl.searchParams.get('episode'), '2');
+    assert.equal(searchUrl.searchParams.has(' Death'), false);
+  });
+
+  await t.test('buildSearchAnimeUrl should derive /search/anime from /search/episodes requests', async () => {
+    const searchUrl = buildSearchAnimeUrl(`${urlPrefix}/api/v2/search/episodes?anime=Love%20%26%20Death&episode=2`, 'Love & Death');
+
+    assert.equal(searchUrl.pathname, '/api/v2/search/anime');
+    assert.equal(searchUrl.searchParams.get('keyword'), 'Love & Death');
+    assert.equal(searchUrl.searchParams.has('season'), false);
+    assert.equal(searchUrl.searchParams.has('episode'), false);
   });
 
   // 测试标题解析
@@ -103,6 +249,635 @@ test('worker.js API endpoints', async (t) => {
     assert(title === "宇宙Marry Me?" && season == 2 && episode == 8, `Expected title === "宇宙Marry Me?" && season == 2 && episode == 8, but got ${title} ${season} ${episode}`);
   });
 
+  // await t.test('GET /api/v2/comment/:id?format=json&duration=true should return segment duration and reuse comment cache', async () => {
+  //   Globals.init({});
+  //   Globals.animes = [];
+  //   Globals.episodeIds = [];
+  //   Globals.episodeNum = 10001;
+  //   Globals.commentCache = new Map();
+
+  //   const originalTencentGetComments = TencentSource.prototype.getComments;
+  //   let commentRequestCount = 0;
+  //   let durationRequestCount = 0;
+
+  //   TencentSource.prototype.getComments = async function(url, plat, segmentFlag) {
+  //     if (segmentFlag) {
+  //       durationRequestCount++;
+  //       return {
+  //         type: 'qq',
+  //         segmentList: [
+  //           { type: 'qq', segment_start: 0, segment_end: 60, url: 'mock-1' },
+  //           { type: 'qq', segment_start: 60, segment_end: 2760, url: 'mock-2' }
+  //         ]
+  //       };
+  //     }
+
+  //     commentRequestCount++;
+  //     return [
+  //       { p: '12.3,1,16777215,qq', m: '测试弹幕1' },
+  //       { p: '45.6,1,16777215,qq', m: '测试弹幕2' }
+  //     ];
+  //   };
+
+  //   try {
+  //     const episode = addEpisode('https://v.qq.com/x/cover/a/b.html', '【qq】测试样例');
+  //     const req = new MockRequest(urlPrefix + '/api/v2/comment/' + episode.id + '?format=json&duration=true', { method: 'GET' });
+  //     const res = await handleRequest(req);
+  //     const body = await parseResponse(res);
+  //     const cachedRes = await handleRequest(req);
+  //     const cachedBody = await parseResponse(cachedRes);
+
+  //     assert.equal(res.status, 200);
+  //     assert.equal(body.videoDuration, 2760);
+  //     assert.equal(body.count, 2);
+  //     assert.equal(body.comments.length, 2);
+  //     assert.equal(cachedRes.status, 200);
+  //     assert.equal(cachedBody.videoDuration, 2760);
+  //     assert.equal(commentRequestCount, 1);
+  //     assert.equal(durationRequestCount, 2);
+  //     assert.equal(Globals.commentCache.size, 1);
+  //   } finally {
+  //     TencentSource.prototype.getComments = originalTencentGetComments;
+  //     Globals.episodeIds = [];
+  //     Globals.commentCache = new Map();
+  //   }
+  // });
+
+  // await t.test('GET /api/v2/comment/:id?format=json&duration=true should use merged max duration', async () => {
+  //   Globals.init({});
+  //   Globals.animes = [];
+  //   Globals.episodeIds = [];
+  //   Globals.episodeNum = 10001;
+  //   Globals.commentCache = new Map();
+
+  //   const originalTencentGetComments = TencentSource.prototype.getComments;
+  //   const originalIqiyiGetComments = IqiyiSource.prototype.getComments;
+  //   const originalYoukuGetComments = YoukuSource.prototype.getComments;
+
+  //   TencentSource.prototype.getComments = async function(url, plat, segmentFlag) {
+  //     if (segmentFlag) {
+  //       return {
+  //         type: 'qq',
+  //         segmentList: [
+  //           { type: 'qq', segment_start: 0, segment_end: 2760, url: 'mock-qq' }
+  //         ]
+  //       };
+  //     }
+  //     return [
+  //       { p: '12.3,1,16777215,qq', m: '腾讯弹幕' }
+  //     ];
+  //   };
+
+  //   IqiyiSource.prototype.getComments = async function(url, plat, segmentFlag) {
+  //     if (segmentFlag) {
+  //       return {
+  //         type: 'qiyi',
+  //         segmentList: [
+  //           { type: 'qiyi', segment_start: 0, segment_end: 1200, url: 'mock-qiyi-1' },
+  //           { type: 'qiyi', segment_start: 1200, segment_end: 2682, url: 'mock-qiyi-2' }
+  //         ]
+  //       };
+  //     }
+  //     return [
+  //       { p: '15.0,1,16777215,qiyi', m: '爱奇艺弹幕' }
+  //     ];
+  //   };
+
+  //   YoukuSource.prototype.getComments = async function(url, plat, segmentFlag) {
+  //     if (segmentFlag) {
+  //       return {
+  //         type: 'youku',
+  //         segmentList: [
+  //           { type: 'youku', segment_start: 0, segment_end: 1800, url: 'mock-youku-1' },
+  //           { type: 'youku', segment_start: 1800, segment_end: 3000, url: 'mock-youku-2' }
+  //         ]
+  //       };
+  //     }
+  //     return [
+  //       { p: '18.0,1,16777215,youku', m: '优酷弹幕' }
+  //     ];
+  //   };
+
+  //   try {
+  //     const episode = addEpisode(
+  //       'tencent:https://v.qq.com/x/cover/a/b.html$$$iqiyi:https://www.iqiyi.com/v_test.html$$$youku:https://v.youku.com/v_show/id_test.html',
+  //       '【qq＆qiyi＆youku】合并测试'
+  //     );
+  //     const req = new MockRequest(urlPrefix + '/api/v2/comment/' + episode.id + '?format=json&duration=true', { method: 'GET' });
+  //     const res = await handleRequest(req);
+  //     const body = await parseResponse(res);
+
+  //     assert.equal(res.status, 200);
+  //     assert.equal(body.videoDuration, 3000);
+  //     assert.ok(Array.isArray(body.comments));
+  //   } finally {
+  //     TencentSource.prototype.getComments = originalTencentGetComments;
+  //     IqiyiSource.prototype.getComments = originalIqiyiGetComments;
+  //     YoukuSource.prototype.getComments = originalYoukuGetComments;
+  //     Globals.episodeIds = [];
+  //     Globals.commentCache = new Map();
+  //   }
+  // });
+
+  // await t.test('GET /api/v2/comment/:id?format=json&duration=true should prefer explicit duration field', async () => {
+  //   Globals.init({});
+  //   Globals.animes = [];
+  //   Globals.episodeIds = [];
+  //   Globals.episodeNum = 10001;
+  //   Globals.commentCache = new Map();
+
+  //   const originalBilibiliGetComments = BilibiliSource.prototype.getComments;
+  //   BilibiliSource.prototype.getComments = async function(url, plat, segmentFlag) {
+  //     if (segmentFlag) {
+  //       return new SegmentListResponse({
+  //         type: 'bilibili1',
+  //         duration: 1312.76,
+  //         segmentList: [
+  //           { type: 'bilibili1', segment_start: 0, segment_end: 360, url: 'mock-bili-1' },
+  //           { type: 'bilibili1', segment_start: 360, segment_end: 720, url: 'mock-bili-2' },
+  //           { type: 'bilibili1', segment_start: 720, segment_end: 1080, url: 'mock-bili-3' },
+  //           { type: 'bilibili1', segment_start: 1080, segment_end: 1440, url: 'mock-bili-4' }
+  //         ]
+  //       });
+  //     }
+  //     return [
+  //       { p: '20.0,1,16777215,bilibili1', m: 'B站弹幕1' },
+  //       { p: '30.0,1,16777215,bilibili1', m: 'B站弹幕2' }
+  //     ];
+  //   };
+
+  //   try {
+  //     const episode = addEpisode('https://www.bilibili.com/bangumi/play/ep_test.html', '【bilibili】测试样例');
+  //     const req = new MockRequest(urlPrefix + '/api/v2/comment/' + episode.id + '?format=json&duration=true', { method: 'GET' });
+  //     const res = await handleRequest(req);
+  //     const body = await parseResponse(res);
+
+  //     assert.equal(res.status, 200);
+  //     assert.equal(body.videoDuration, 1312.76);
+  //     assert.equal(body.count, 2);
+  //   } finally {
+  //     BilibiliSource.prototype.getComments = originalBilibiliGetComments;
+  //     Globals.episodeIds = [];
+  //     Globals.commentCache = new Map();
+  //   }
+  // });
+
+  // await t.test('GET /api/v2/bangumi/:id should resolve details from search cache after global eviction', async () => {
+  //   Globals.init({});
+  //   Globals.animes = [];
+  //   Globals.episodeIds = [];
+  //   Globals.episodeNum = 10001;
+  //   Globals.searchCache = new Map();
+  //   Globals.requestHistory = new Map();
+  //   Globals.envs.rateLimitMaxRequests = 0;
+  //   delete Globals.requestAnimeDetailsMap;
+
+  //   const cachedAnime = {
+  //     animeId: 500001,
+  //     bangumiId: '500001',
+  //     animeTitle: '缓存详情番剧',
+  //     type: 'tvseries',
+  //     typeDescription: 'TV',
+  //     imageUrl: 'https://example.com/poster.jpg',
+  //     startDate: '2024-01-01T00:00:00.000Z',
+  //     episodeCount: 2,
+  //     rating: 0,
+  //     isFavorited: true,
+  //     source: 'tencent',
+  //     links: [
+  //       { id: 30001, url: 'https://v.qq.com/x/cover/cache/ep1.html', title: '【qq】 第1集' },
+  //       { id: 30002, url: 'https://v.qq.com/x/cover/cache/ep2.html', title: '【qq】 第2集' }
+  //     ]
+  //   };
+
+  //   Globals.searchCache.set('缓存详情番剧', {
+  //     results: [
+  //       {
+  //         animeId: cachedAnime.animeId,
+  //         bangumiId: cachedAnime.bangumiId,
+  //         animeTitle: cachedAnime.animeTitle,
+  //         type: cachedAnime.type,
+  //         typeDescription: cachedAnime.typeDescription,
+  //         imageUrl: cachedAnime.imageUrl,
+  //         startDate: cachedAnime.startDate,
+  //         episodeCount: cachedAnime.episodeCount,
+  //         rating: cachedAnime.rating,
+  //         isFavorited: cachedAnime.isFavorited,
+  //         source: cachedAnime.source
+  //       }
+  //     ],
+  //     details: [cachedAnime],
+  //     timestamp: Date.now()
+  //   });
+
+  //   const req = new MockRequest(urlPrefix + '/api/v2/bangumi/' + cachedAnime.animeId, { method: 'GET' });
+  //   const res = await handleRequest(req);
+  //   const body = await parseResponse(res);
+
+  //   assert.equal(res.status, 200);
+  //   assert.equal(body.success, true);
+  //   assert.equal(body.bangumi.animeTitle, cachedAnime.animeTitle);
+  //   assert.equal(body.bangumi.episodes.length, 2);
+  //   assert.equal(body.bangumi.episodes[0].episodeId, 30001);
+  //   assert.equal(Globals.animes.length, 0);
+  //   assert.equal(Globals.episodeIds.length, 0);
+  // });
+
+  // await t.test('GET /api/v2/comment/:id should resolve cached episode context after global eviction', async () => {
+  //   Globals.init({});
+  //   Globals.animes = [];
+  //   Globals.episodeIds = [];
+  //   Globals.episodeNum = 10001;
+  //   Globals.searchCache = new Map();
+  //   Globals.commentCache = new Map();
+  //   Globals.requestHistory = new Map();
+  //   Globals.envs.rateLimitMaxRequests = 0;
+  //   delete Globals.requestAnimeDetailsMap;
+
+  //   const cachedAnime = {
+  //     animeId: 500002,
+  //     bangumiId: '500002',
+  //     animeTitle: '缓存弹幕番剧',
+  //     type: 'tvseries',
+  //     typeDescription: 'TV',
+  //     imageUrl: 'https://example.com/poster2.jpg',
+  //     startDate: '2024-01-01T00:00:00.000Z',
+  //     episodeCount: 1,
+  //     rating: 0,
+  //     isFavorited: true,
+  //     source: 'tencent',
+  //     links: [
+  //       { id: 31001, url: 'https://v.qq.com/x/cover/cache/comment-ep1.html', title: '【qq】 第1集' }
+  //     ]
+  //   };
+
+  //   Globals.searchCache.set('缓存弹幕番剧', {
+  //     results: [
+  //       {
+  //         animeId: cachedAnime.animeId,
+  //         bangumiId: cachedAnime.bangumiId,
+  //         animeTitle: cachedAnime.animeTitle,
+  //         type: cachedAnime.type,
+  //         typeDescription: cachedAnime.typeDescription,
+  //         imageUrl: cachedAnime.imageUrl,
+  //         startDate: cachedAnime.startDate,
+  //         episodeCount: cachedAnime.episodeCount,
+  //         rating: cachedAnime.rating,
+  //         isFavorited: cachedAnime.isFavorited,
+  //         source: cachedAnime.source
+  //       }
+  //     ],
+  //     details: [cachedAnime],
+  //     timestamp: Date.now()
+  //   });
+
+  //   const originalTencentGetComments = TencentSource.prototype.getComments;
+  //   let requestCount = 0;
+
+  //   TencentSource.prototype.getComments = async function(url, plat, segmentFlag) {
+  //     requestCount++;
+  //     assert.equal(url, cachedAnime.links[0].url);
+  //     assert.equal(plat, 'qq');
+  //     assert.equal(segmentFlag, false);
+  //     return [
+  //       { p: '12.3,1,16777215,qq', m: '缓存弹幕命中' }
+  //     ];
+  //   };
+
+  //   try {
+  //     const req = new MockRequest(urlPrefix + '/api/v2/comment/' + cachedAnime.links[0].id + '?format=json', { method: 'GET' });
+  //     const res = await handleRequest(req);
+  //     const body = await parseResponse(res);
+
+  //     assert.equal(res.status, 200);
+  //     assert.equal(body.count, 1);
+  //     assert.equal(body.comments[0].m, '缓存弹幕命中');
+  //     assert.equal(requestCount, 1);
+  //     assert.equal(Globals.animes.length, 0);
+  //     assert.equal(Globals.episodeIds.length, 0);
+  //   } finally {
+  //     TencentSource.prototype.getComments = originalTencentGetComments;
+  //     Globals.commentCache = new Map();
+  //   }
+  // });
+  // await t.test('GET /api/v2/bangumi/:id should prefer latest cached detail snapshot', async () => {
+  //   resetSearchState();
+
+  //   const oldAnime = {
+  //     animeId: 500003,
+  //     bangumiId: "500003",
+  //     animeTitle: "旧缓存详情番剧",
+  //     type: "tvseries",
+  //     typeDescription: "TV",
+  //     imageUrl: "https://example.com/old-poster.jpg",
+  //     startDate: "2024-01-01T00:00:00.000Z",
+  //     episodeCount: 1,
+  //     rating: 0,
+  //     isFavorited: true,
+  //     source: "tencent",
+  //     links: [
+  //       { id: 32001, url: "https://v.qq.com/x/cover/cache-old/ep1.html", title: "【qq】 旧快照 第1集" }
+  //     ]
+  //   };
+
+  //   const latestAnime = {
+  //     ...oldAnime,
+  //     animeTitle: "新缓存详情番剧",
+  //     episodeCount: 2,
+  //     links: [
+  //       { id: 32002, url: "https://v.qq.com/x/cover/cache-new/ep1.html", title: "【qq】 新快照 第1集" },
+  //       { id: 32003, url: "https://v.qq.com/x/cover/cache-new/ep2.html", title: "【qq】 新快照 第2集" }
+  //     ]
+  //   };
+
+  //   Globals.searchCache.set("旧缓存详情番剧", {
+  //     results: [createSearchResult(oldAnime)],
+  //     details: [oldAnime],
+  //     timestamp: Date.now() - 5_000
+  //   });
+  //   Globals.searchCache.set("新缓存详情番剧", {
+  //     results: [createSearchResult(latestAnime)],
+  //     details: [latestAnime],
+  //     timestamp: Date.now()
+  //   });
+
+  //   const req = new MockRequest(urlPrefix + "/api/v2/bangumi/" + latestAnime.animeId, { method: "GET" });
+  //   const res = await handleRequest(req);
+  //   const body = await parseResponse(res);
+
+  //   assert.equal(res.status, 200);
+  //   assert.equal(body.success, true);
+  //   assert.equal(body.bangumi.animeTitle, latestAnime.animeTitle);
+  //   assert.equal(body.bangumi.episodes.length, 2);
+  //   assert.equal(body.bangumi.episodes[0].episodeId, 32002);
+  //   assert.equal(body.bangumi.episodes[1].episodeId, 32003);
+  // });
+
+  // await t.test('GET /api/v2/search/episodes should keep colliding cached details separated', async () => {
+  //   resetSearchState();
+
+  //   const renrenAnime = {
+  //     animeId: 888,
+  //     bangumiId: "123",
+  //     animeTitle: "缓存冲突番剧A",
+  //     type: "tvseries",
+  //     typeDescription: "TV",
+  //     imageUrl: "https://example.com/renren.jpg",
+  //     startDate: "2024-01-01T00:00:00.000Z",
+  //     episodeCount: 1,
+  //     rating: 0,
+  //     isFavorited: true,
+  //     source: "renren",
+  //     links: [
+  //       { id: 33001, url: "renren://cache-a-ep1", title: "【renren】 第1集" }
+  //     ]
+  //   };
+
+  //   const iqiyiAnime = {
+  //     animeId: 123,
+  //     bangumiId: "999",
+  //     animeTitle: "缓存冲突番剧B",
+  //     type: "tvseries",
+  //     typeDescription: "TV",
+  //     imageUrl: "https://example.com/iqiyi.jpg",
+  //     startDate: "2024-01-01T00:00:00.000Z",
+  //     episodeCount: 1,
+  //     rating: 0,
+  //     isFavorited: true,
+  //     source: "iqiyi",
+  //     links: [
+  //       { id: 33002, url: "https://www.iqiyi.com/v_cache_b.html", title: "【qiyi】 第1集" }
+  //     ]
+  //   };
+
+  //   const keyword = "缓存冲突测试";
+  //   Globals.searchCache.set(keyword, {
+  //     results: [createSearchResult(renrenAnime), createSearchResult(iqiyiAnime)],
+  //     details: [renrenAnime, iqiyiAnime],
+  //     timestamp: Date.now()
+  //   });
+
+  //   const req = new MockRequest(urlPrefix + "/api/v2/search/episodes?anime=" + encodeURIComponent(keyword), { method: "GET" });
+  //   const res = await handleRequest(req);
+  //   const body = await parseResponse(res);
+
+  //   assert.equal(res.status, 200);
+  //   assert.equal(body.success, true);
+  //   assert.equal(body.animes.length, 2);
+
+  //   const renrenResult = body.animes.find(item => item.animeId === renrenAnime.animeId);
+  //   const iqiyiResult = body.animes.find(item => item.animeId === iqiyiAnime.animeId);
+
+  //   assert.ok(renrenResult);
+  //   assert.ok(iqiyiResult);
+  //   assert.equal(renrenResult.episodes.length, 1);
+  //   assert.equal(renrenResult.episodes[0].episodeId, renrenAnime.links[0].id);
+  //   assert.equal(renrenResult.episodes[0].episodeTitle, renrenAnime.links[0].title);
+  //   assert.equal(iqiyiResult.episodes.length, 1);
+  //   assert.equal(iqiyiResult.episodes[0].episodeId, iqiyiAnime.links[0].id);
+  //   assert.equal(iqiyiResult.episodes[0].episodeTitle, iqiyiAnime.links[0].title);
+  // });
+
+  // await t.test('GET /api/v2/search/episodes should ignore polluted global detail cache state', async () => {
+  //   resetSearchState();
+
+  //   const cachedAnime = {
+  //     animeId: 700001,
+  //     bangumiId: "700001",
+  //     animeTitle: "全局污染回归番剧",
+  //     type: "tvseries",
+  //     typeDescription: "TV",
+  //     imageUrl: "https://example.com/cache-correct.jpg",
+  //     startDate: "2024-01-01T00:00:00.000Z",
+  //     episodeCount: 1,
+  //     rating: 0,
+  //     isFavorited: true,
+  //     source: "tencent",
+  //     links: [
+  //       { id: 34001, url: "https://v.qq.com/x/cover/cache-correct/ep1.html", title: "【qq】 正确第1集" }
+  //     ]
+  //   };
+
+  //   const pollutedAnime = {
+  //     ...cachedAnime,
+  //     animeTitle: "错误污染番剧",
+  //     links: [
+  //       { id: 34999, url: "https://v.qq.com/x/cover/cache-polluted/ep1.html", title: "【qq】 错误第1集" }
+  //     ]
+  //   };
+
+  //   const keyword = "全局污染测试";
+  //   Globals.searchCache.set(keyword, {
+  //     results: [createSearchResult(cachedAnime)],
+  //     details: [cachedAnime],
+  //     timestamp: Date.now()
+  //   });
+  //   Globals.requestAnimeDetailsMap = new Map([
+  //     [String(cachedAnime.bangumiId), pollutedAnime],
+  //     [String(cachedAnime.animeId), pollutedAnime]
+  //   ]);
+
+  //   try {
+  //     const req = new MockRequest(urlPrefix + "/api/v2/search/episodes?anime=" + encodeURIComponent(keyword), { method: "GET" });
+  //     const res = await handleRequest(req);
+  //     const body = await parseResponse(res);
+
+  //     assert.equal(res.status, 200);
+  //     assert.equal(body.success, true);
+  //     assert.equal(body.animes.length, 1);
+  //     assert.equal(body.animes[0].animeId, cachedAnime.animeId);
+  //     assert.equal(body.animes[0].episodes[0].episodeId, cachedAnime.links[0].id);
+  //     assert.equal(body.animes[0].episodes[0].episodeTitle, cachedAnime.links[0].title);
+  //   } finally {
+  //     delete Globals.requestAnimeDetailsMap;
+  //   }
+  // });
+
+  // await t.test('POST /api/v2/match should ignore polluted global anime details and use current search snapshot', async () => {
+  //   resetSearchState();
+
+  //   const correctLinks = Array.from({ length: 50 }, (_, index) => ({
+  //     id: 35001 + index,
+  //     url: `https://www.iqiyi.com/v_match_correct_${index + 1}.html`,
+  //     title: `【qiyi】 太平年第${index + 1}集`
+  //   }));
+
+  //   const cachedAnime = {
+  //     animeId: 700002,
+  //     bangumiId: "700002",
+  //     animeTitle: "太平年(2024)【TV】from iqiyi",
+  //     type: "tvseries",
+  //     typeDescription: "TV",
+  //     imageUrl: "https://example.com/tp.jpg",
+  //     startDate: "2024-01-01T00:00:00.000Z",
+  //     episodeCount: 50,
+  //     rating: 0,
+  //     isFavorited: true,
+  //     source: "iqiyi",
+  //     links: correctLinks
+  //   };
+
+  //   const pollutedAnime = {
+  //     ...cachedAnime,
+  //     links: correctLinks.map(link => ({ ...link }))
+  //   };
+  //   pollutedAnime.links[41] = {
+  //     id: 35999,
+  //     url: "https://www.iqiyi.com/v_match_polluted_45.html",
+  //     title: "【qiyi】 太平年第45集 金陵落日"
+  //   };
+
+  //   Globals.searchCache.set("太平年", {
+  //     results: [createSearchResult(cachedAnime)],
+  //     details: [cachedAnime],
+  //     timestamp: Date.now()
+  //   });
+  //   Globals.animes = [pollutedAnime];
+
+  //   const req = {
+  //     url: urlPrefix + "/api/v2/match",
+  //     async json() {
+  //       return {
+  //         fileName: "太平年 S01E42"
+  //       };
+  //     }
+  //   };
+
+  //   const res = await matchAnime(new URL(req.url), req, "127.0.0.1");
+  //   const body = await parseResponse(res);
+
+  //   assert.equal(res.status, 200);
+  //   assert.equal(body.success, true);
+  //   assert.equal(body.isMatched, true);
+  //   assert.equal(body.matches.length, 1);
+  //   assert.equal(body.matches[0].episodeId, cachedAnime.links[41].id);
+  //   assert.equal(body.matches[0].episodeTitle, cachedAnime.links[41].title);
+  // });
+
+  // await t.test('GET /api/v2/search/anime should filter by request snapshot instead of collided runtime animeId state', async () => {
+  //   resetSearchState();
+
+  //   const originalTencentSearch = TencentSource.prototype.search;
+  //   const originalTencentHandleAnimes = TencentSource.prototype.handleAnimes;
+  //   const originalIqiyiSearch = IqiyiSource.prototype.search;
+  //   const originalIqiyiHandleAnimes = IqiyiSource.prototype.handleAnimes;
+  //   const originalSourceOrderArr = Array.isArray(Globals.envs.sourceOrderArr) ? [...Globals.envs.sourceOrderArr] : Globals.envs.sourceOrderArr;
+  //   const originalEnableAnimeEpisodeFilter = Globals.envs.enableAnimeEpisodeFilter;
+  //   const originalEpisodeTitleFilter = Globals.envs.episodeTitleFilter;
+  //   const originalAnimeTitleFilter = Globals.envs.animeTitleFilter;
+
+  //   const sharedAnimeId = 880001;
+  //   const tencentAnime = {
+  //     animeId: sharedAnimeId,
+  //     bangumiId: "tx-880001",
+  //     animeTitle: "同ID跨源番剧",
+  //     type: "tvseries",
+  //     typeDescription: "TV",
+  //     imageUrl: "",
+  //     startDate: "2024-01-01T00:00:00.000Z",
+  //     episodeCount: 1,
+  //     rating: 0,
+  //     isFavorited: false,
+  //     source: "tencent",
+  //     links: [
+  //       { url: "https://v.qq.com/x/cover/collision/ep1.html", title: "【qq】 正片第1集" }
+  //     ]
+  //   };
+  //   const iqiyiAnime = {
+  //     animeId: sharedAnimeId,
+  //     bangumiId: "iqiyi-880001",
+  //     animeTitle: "同ID跨源番剧",
+  //     type: "tvseries",
+  //     typeDescription: "TV",
+  //     imageUrl: "",
+  //     startDate: "2024-01-01T00:00:00.000Z",
+  //     episodeCount: 1,
+  //     rating: 0,
+  //     isFavorited: false,
+  //     source: "iqiyi",
+  //     links: [
+  //       { url: "https://www.iqiyi.com/v_collision_extra.html", title: "【qiyi】 花絮" }
+  //     ]
+  //   };
+
+  //   Globals.envs.sourceOrderArr = ["tencent", "iqiyi"];
+  //   Globals.envs.enableAnimeEpisodeFilter = true;
+  //   Globals.envs.episodeTitleFilter = /花絮/;
+  //   Globals.envs.animeTitleFilter = null;
+
+  //   TencentSource.prototype.search = async () => [createSearchResult(tencentAnime)];
+  //   TencentSource.prototype.handleAnimes = async (_results, _queryTitle, curAnimes, detailStore) => {
+  //     curAnimes.push(createSearchResult(tencentAnime));
+  //     addAnime(tencentAnime, detailStore);
+  //   };
+  //   IqiyiSource.prototype.search = async () => [createSearchResult(iqiyiAnime)];
+  //   IqiyiSource.prototype.handleAnimes = async (_results, _queryTitle, curAnimes, detailStore) => {
+  //     curAnimes.push(createSearchResult(iqiyiAnime));
+  //     addAnime(iqiyiAnime, detailStore);
+  //   };
+
+  //   try {
+  //     const req = new MockRequest(urlPrefix + "/api/v2/search/anime?keyword=" + encodeURIComponent("同ID跨源番剧"), { method: "GET" });
+  //     const res = await searchAnime(new URL(req.url), null, null, new Map());
+  //     const body = await parseResponse(res);
+
+  //     assert.equal(res.status, 200);
+  //     assert.equal(body.success, true);
+  //     assert.equal(body.animes.length, 1);
+  //     assert.equal(body.animes[0].animeId, tencentAnime.animeId);
+  //     assert.equal(body.animes[0].source, tencentAnime.source);
+  //     assert.equal(body.animes[0].animeTitle, tencentAnime.animeTitle);
+  //   } finally {
+  //     TencentSource.prototype.search = originalTencentSearch;
+  //     TencentSource.prototype.handleAnimes = originalTencentHandleAnimes;
+  //     IqiyiSource.prototype.search = originalIqiyiSearch;
+  //     IqiyiSource.prototype.handleAnimes = originalIqiyiHandleAnimes;
+  //     Globals.envs.sourceOrderArr = Array.isArray(originalSourceOrderArr) ? [...originalSourceOrderArr] : originalSourceOrderArr;
+  //     Globals.envs.enableAnimeEpisodeFilter = originalEnableAnimeEpisodeFilter;
+  //     Globals.envs.episodeTitleFilter = originalEpisodeTitleFilter;
+  //     Globals.envs.animeTitleFilter = originalAnimeTitleFilter;
+  //   }
+  // });
   // await t.test('Test ai cilent', async () => {
   //   const ai = new AIClient({
   //     apiKey: 'xxxxxxxxxxxxxxxxxxxxx',
@@ -347,9 +1122,333 @@ test('worker.js API endpoints', async (t) => {
   //   assert(res.length >= 0, `Expected res.length >= 0, but got ${res.length}`);
   // });
 
+  // await t.test('GET aiyifan danmu', async () => {
+  //   const res = await aiyifanSource.getComments("https://www.yfsp.tv/play/E4si52uysIH?id=dpK7e0uLKe2", "aiyifan");
+  //   assert(res.length > 2, `Expected res.length > 2, but got ${res.length}`);
+  // });
+
+  // await t.test('GET aiyifan danmu segments', async () => {
+  //   const res = await aiyifanSource.getComments("https://www.yfsp.tv/play/E4si52uysIH?id=dpK7e0uLKe2", "aiyifan", true);
+  //   console.log(res.segmentList);
+  //   assert(res.type === "aiyifan", `Expected res.type === "aiyifan", but got ${res.type === "aiyifan"}`);
+  //   assert(res.segmentList.length >= 0, `Expected res.segmentList.length >= 0, but got ${res.segmentList.length}`);
+  // });
+
+  // await t.test('GET aiyifan segment danmu', async () => {
+  //   const segment = Segment.fromJson({
+  //     type: 'aiyifan',
+  //     segment_start: 0,
+  //     segment_end: 0,
+  //     url: 'https://app-m10.tripdata.app/api/video/getBarrage?uniqueKey=https://www.yfsp.tv/play/E4si52uysIH?id=dpK7e0uLKe2'
+  //   });
+  //   const res = await aiyifanSource.getSegmentComments(segment);
+  //   assert(res.length >= 0, `Expected res.length >= 0, but got ${res.length}`);
+  // });
+
+  // await t.test('GET hongguo danmu', async () => {
+  //   const episodeId = 'hongguo:v1:series-1:vid-1:60';
+  //   const originalFetchCommentWindow = hongguoSource.fetchCommentWindow;
+  //   hongguoSource.fetchCommentWindow = async (_info, startMs) => ({
+  //     comments: startMs === 0
+  //       ? [{ commentId: 'comment-1', offsetMs: 1500, text: 'first', diggCount: 7 }]
+  //       : [
+  //           { commentId: 'comment-1', offsetMs: 1500, text: 'first', diggCount: 7 },
+  //           { commentId: 'comment-2', offsetMs: 31500, text: 'second', diggCount: 3 },
+  //         ],
+  //     nextStart: startMs + 30000,
+  //     cursor: `cursor-${startMs}`,
+  //     hasMore: true,
+  //   });
+  //   try {
+  //     const res = await hongguoSource.getComments(episodeId, 'hongguo');
+  //     assert.equal(res.length, 2);
+  //     assert.deepEqual(res.map((item) => item.t), [1.5, 31.5]);
+  //     assert.match(res[0].p, /\[hongguo\]$/);
+  //   } finally {
+  //     hongguoSource.fetchCommentWindow = originalFetchCommentWindow;
+  //   }
+  // });
+
+  // await t.test('GET hongguo danmu segments', async () => {
+  //   const episodeId = 'hongguo:v1:series-1:vid-1:60';
+  //   const res = await hongguoSource.getComments(episodeId, 'hongguo', true);
+  //   assert.equal(res.type, 'hongguo');
+  //   assert.equal(res.duration, 60);
+  //   assert.equal(res.segmentList.length, 2);
+  //   assert.notEqual(res.segmentList[0].url, res.segmentList[1].url);
+  // });
+
+  // await t.test('GET hongguo segment danmu', async () => {
+  //   const originalFetchCommentWindow = hongguoSource.fetchCommentWindow;
+  //   hongguoSource.fetchCommentWindow = async () => ({
+  //     comments: [
+  //       { commentId: 'before', offsetMs: 29999, text: 'before', diggCount: 0 },
+  //       { commentId: 'inside', offsetMs: 31500, text: 'inside', diggCount: 2 },
+  //       { commentId: 'after', offsetMs: 60000, text: 'after', diggCount: 0 },
+  //     ],
+  //     nextStart: 60000,
+  //     cursor: '',
+  //     hasMore: false,
+  //   });
+  //   try {
+  //     const segment = Segment.fromJson({
+  //       type: 'hongguo',
+  //       segment_start: 30,
+  //       segment_end: 60,
+  //       url: 'hongguo:v1:series-1:vid-1:60#segment=30',
+  //     });
+  //     const res = await hongguoSource.getSegmentComments(segment);
+  //     assert.equal(res.length, 1);
+  //     assert.equal(res[0].m, 'inside');
+  //     assert.equal(res[0].t, 31.5);
+  //   } finally {
+  //     hongguoSource.fetchCommentWindow = originalFetchCommentWindow;
+  //   }
+  // });
+
+  // await t.test('Hongguo player URL should resolve the exact episode', async () => {
+  //   const playerUrl = 'https://hongguoduanju.com/player/7572458140411628568/7572460055539223614';
+  //   assert.deepEqual(parseHongguoPlayerUrl(playerUrl), {
+  //     seriesId: '7572458140411628568',
+  //     vid: '7572460055539223614',
+  //   });
+
+  //   const source = new HongguoSource();
+  //   let requestedSeriesId = '';
+  //   let detailRequests = 0;
+  //   source.getEpisodes = async (seriesId) => {
+  //     detailRequests++;
+  //     requestedSeriesId = seriesId;
+  //     return {
+  //       episodes: [
+  //         { index: 1, vid: '7572459982168280126', duration: 150 },
+  //         { index: 2, vid: '7572460055539223614', duration: 119 },
+  //       ],
+  //       imageUrl: '',
+  //     };
+  //   };
+
+  //   const segments = await source.getComments(playerUrl, 'hongguo', true);
+  //   assert.equal(requestedSeriesId, '7572458140411628568');
+  //   assert.equal(segments.duration, 119);
+  //   assert.equal(segments.segmentList.length, 4);
+  //   assert.equal(
+  //     segments.segmentList[0].url,
+  //     'hongguo:v1:7572458140411628568:7572460055539223614:119#segment=0',
+  //   );
+
+  //   source.fetchCommentWindow = async (info) => {
+  //     assert.equal(info.vid, '7572460055539223614');
+  //     return {
+  //       comments: [{ commentId: 'link-comment', offsetMs: 1500, text: '链接弹幕', diggCount: 2 }],
+  //       nextStart: 119000,
+  //       cursor: '',
+  //       hasMore: false,
+  //     };
+  //   };
+  //   const comments = await source.getComments(playerUrl, 'hongguo');
+  //   assert.equal(detailRequests, 1);
+  //   assert.equal(comments.length, 1);
+  //   assert.equal(comments[0].m, '链接弹幕');
+  // });
+
+  // await t.test('GET comments by Hongguo player URL should use resolved vid', async () => {
+  //   const seriesId = '7572458140411628568';
+  //   const vid = '7572460055539223614';
+  //   const playerUrl = `https://hongguoduanju.com/player/${seriesId}/${vid}`;
+  //   const requestedUrls = [];
+
+  //   const response = await withMockFetch(async (url) => {
+  //     requestedUrls.push(String(url));
+  //     if (String(url).includes('/novel/player/multi_video_detail/v1/')) {
+  //       return mockJsonResponse({
+  //         code: 0,
+  //         data: {
+  //           [seriesId]: {
+  //             video_data: {
+  //               video_list: [{ vid_index: 1, vid, duration: 119 }],
+  //             },
+  //           },
+  //         },
+  //       }, String(url));
+  //     }
+  //     if (String(url).includes(`/novel/commentapi/comment/list/${vid}/v1/`)) {
+  //       return mockJsonResponse({
+  //         code: 0,
+  //         data: {
+  //           data_list: [{
+  //             comment: {
+  //               comment_id: 'route-comment',
+  //               common: { content: { text: '路由弹幕' } },
+  //               expand: { offset_time: 1500 },
+  //               stat: { digg_count: 3 },
+  //             },
+  //           }],
+  //           common_list_info: { cursor: '', has_more: false },
+  //           extra: { next_query_danmaku_list_time: 119000 },
+  //         },
+  //       }, String(url));
+  //     }
+  //     throw new Error(`Unexpected Hongguo request: ${url}`);
+  //   }, () => getCommentByUrl(playerUrl, 'json', false));
+
+  //   const body = await parseResponse(response);
+  //   assert.equal(body.count, 1);
+  //   assert.equal(body.comments[0].m, '路由弹幕');
+  //   assert(requestedUrls.some((url) => url.includes('/novel/player/multi_video_detail/v1/')));
+  //   assert(requestedUrls.some((url) => url.includes(`/novel/commentapi/comment/list/${vid}/v1/`)));
+  // });
+
   // await t.test('GET other_server danmu', async () => {
   //   const res = await otherSource.getComments("https://www.bilibili.com/bangumi/play/ep1231564");
   //   assert(res.length > 2, `Expected res.length > 2, but got ${res.length}`);
+  // });
+
+  // await t.test('Hanjutv warmup should retry after failure and share concurrent promise', async () => {
+  //   const source = new HanjutvSource();
+  //   let attempts = 0;
+  //   let finishFirst;
+  //   source.buildMobileHeaders = async () => ({ uid: 'stable-uid', headers: {} });
+  //   source.warmupMobileIdentity = async () => {
+  //     attempts++;
+  //     if (attempts === 1) return new Promise(resolve => { finishFirst = resolve; });
+  //     return true;
+  //   };
+
+  //   const concurrent = [source.ensureMobileIdentityWarmed(), source.ensureMobileIdentityWarmed()];
+  //   await new Promise(resolve => setImmediate(resolve));
+  //   assert.equal(attempts, 1);
+  //   finishFirst(false);
+  //   await Promise.all(concurrent);
+  //   await source.ensureMobileIdentityWarmed();
+  //   await source.ensureMobileIdentityWarmed();
+  //   assert.equal(attempts, 2);
+  // });
+
+  // await t.test('Hanjutv details should stay fully parallel and preserve candidate order', async () => {
+  //   const source = new HanjutvSource();
+  //   const candidates = Array.from({ length: 6 }, (_, index) => ({ sid: `sid-${index}`, name: `顺序测试剧${index}` }));
+  //   const resolvers = new Map();
+  //   const started = [];
+  //   const previous = { animes: Globals.animes, episodeIds: Globals.episodeIds, episodeNum: Globals.episodeNum };
+  //   Globals.animes = [];
+  //   Globals.episodeIds = [];
+  //   Globals.episodeNum = 10001;
+  //   source.buildAnimePayload = anime => new Promise(resolve => {
+  //     started.push(anime.sid);
+  //     resolvers.set(anime.sid, resolve);
+  //   });
+  //   source.sortAndPushAnimesByYear = (items, target) => target.push(...items);
+
+  //   try {
+  //     const current = [];
+  //     const task = source.handleAnimes(candidates, '顺序测试剧', current, new Map());
+  //     await new Promise(resolve => setImmediate(resolve));
+  //     assert.deepEqual(started, candidates.map(item => item.sid));
+  //     [...candidates].reverse().forEach(anime => {
+  //       const index = candidates.indexOf(anime);
+  //       resolvers.get(anime.sid)({
+  //         summary: { animeId: 900000 + index, bangumiId: String(900000 + index), animeTitle: anime.name, type: '韩剧', typeDescription: '韩剧', imageUrl: '', startDate: '2025-01-01T00:00:00Z', episodeCount: 1, rating: 0, isFavorited: true, source: 'hanjutv' },
+  //         links: [{ name: '第1集', url: `hxq:${anime.sid}`, title: '【hanjutv】 第1集' }],
+  //       });
+  //     });
+  //     const expected = candidates.map(item => item.name);
+  //     assert.deepEqual((await task).map(item => item.animeTitle), expected);
+  //     assert.deepEqual(current.map(item => item.animeTitle), expected);
+  //     assert.deepEqual(Globals.animes.map(item => item.animeTitle), expected);
+  //   } finally {
+  //     Globals.animes = previous.animes;
+  //     Globals.episodeIds = previous.episodeIds;
+  //     Globals.episodeNum = previous.episodeNum;
+  //   }
+  // });
+
+  // await t.test('Hanjutv should merge only exact titles and disambiguate duplicate names', async () => {
+  //   const source = new HanjutvSource();
+  //   const getMergedPairs = (keyword, s5Items, tvItems) => source
+  //     .mergeSearchCandidates(keyword, s5Items, tvItems)
+  //     .resultList
+  //     .filter(item => item._variant === 'merged')
+  //     .map(item => [item.sid, item.tvSid])
+  //     .sort((left, right) => left[0].localeCompare(right[0]));
+
+  //   const taxi = source.mergeSearchCandidates('模范出租车', [
+  //     { sid: 's3', name: '模范出租车3' },
+  //     { sid: 's2', name: '模范出租车2' },
+  //   ], [
+  //     { sid: 't2', name: '模范出租车2' },
+  //     { sid: 't3', name: '模范出租车3' },
+  //   ]).resultList.filter(item => item._variant === 'merged');
+  //   assert.deepEqual(taxi.map(item => [item.name, item.tvSid]), [
+  //     ['模范出租车3', 't3'],
+  //     ['模范出租车2', 't2'],
+  //   ]);
+
+  //   const duplicate = source.mergeSearchCandidates('配对游戏', [
+  //     { sid: 's-new', name: '配对游戏', playMode: 100, publishTime: '2025-01-01', lastSerialNo: 6 },
+  //     { sid: 's-old', name: '配对游戏', playMode: 101, publishTime: '2024-01-01', lastSerialNo: 63 },
+  //   ], [
+  //     { sid: 't-old', name: '配对游戏', playMode: 101, publishTime: '2024-01-01', lastSerialNo: 63 },
+  //     { sid: 't-new', name: '配对游戏', playMode: 100, publishTime: '2025-01-01', lastSerialNo: 6 },
+  //   ]).resultList.filter(item => item._variant === 'merged');
+  //   assert.deepEqual(duplicate.map(item => item.tvSid), ['t-new', 't-old']);
+
+  //   const partialS5 = [
+  //     { sid: 's-unknown', name: '同名剧', playMode: 100, category: 1 },
+  //     { sid: 's-2025', name: '同名剧', playMode: 100, publishTime: '2025-01-01', category: 1 },
+  //   ];
+  //   const datedTv = [
+  //     { sid: 't-2025', name: '同名剧', playMode: 100, publishTime: '2025-01-01', category: 1 },
+  //   ];
+  //   for (const s5Order of [partialS5, [...partialS5].reverse()]) {
+  //     assert.deepEqual(getMergedPairs('同名剧', s5Order, datedTv), [['s-2025', 't-2025']]);
+  //   }
+
+  //   const ambiguousS5 = [
+  //     { sid: 's-a', name: '歧义剧', playMode: 100, category: 1 },
+  //     { sid: 's-b', name: '歧义剧', playMode: 100, category: 1 },
+  //   ];
+  //   const ambiguousTv = [{ sid: 't-only', name: '歧义剧', playMode: 100, category: 1 }];
+  //   assert.deepEqual(getMergedPairs('歧义剧', ambiguousS5, ambiguousTv), []);
+  //   assert.deepEqual(getMergedPairs('歧义剧', [...ambiguousS5].reverse(), ambiguousTv), []);
+
+  //   assert.deepEqual(getMergedPairs('待播剧', [
+  //     { sid: 's-upcoming', name: '待播剧', playMode: 100, category: 1 },
+  //   ], [
+  //     { sid: 't-upcoming', name: '待播剧', playMode: 100, category: 1 },
+  //   ]), [['s-upcoming', 't-upcoming']]);
+
+  //   const eliminationS5 = [
+  //     { sid: 's-known', name: '排除剧', playMode: 100, publishTime: '2025-01-01', category: 1 },
+  //     { sid: 's-left', name: '排除剧', playMode: 100, category: 1 },
+  //   ];
+  //   const eliminationTv = [
+  //     { sid: 't-left', name: '排除剧', playMode: 100, category: 1 },
+  //     { sid: 't-known', name: '排除剧', playMode: 100, publishTime: '2025-01-01', category: 1 },
+  //   ];
+  //   const expectedEliminationPairs = [['s-known', 't-known'], ['s-left', 't-left']];
+  //   for (const s5Order of [eliminationS5, [...eliminationS5].reverse()]) {
+  //     for (const tvOrder of [eliminationTv, [...eliminationTv].reverse()]) {
+  //       assert.deepEqual(getMergedPairs('排除剧', s5Order, tvOrder), expectedEliminationPairs);
+  //     }
+  //   }
+  // });
+
+  // await t.test('Hanjutv should parse search-pair years without confusing seconds and milliseconds', () => {
+  //   const source = new HanjutvSource();
+  //   assert.equal(source.getSearchPairYear({ publishTime: 888768000000 }), 1998);
+  //   assert.equal(source.getSearchPairYear({ publishTime: '956678400000' }), 2000);
+  //   assert.equal(source.getSearchPairYear({ publishTime: 1735689600 }), 2025);
+  //   assert.equal(source.getSearchPairYear({ publishTime: '20250101' }), 2025);
+  //   assert.equal(source.getSearchPairYear({ releaseTime: '2025-07-11T00:00:00Z' }), 2025);
+  //   assert.equal(source.getSearchPairYear({ publishTime: 0, searchMemo: '1998·韩剧·敬请期待' }), 1998);
+  //   assert.equal(source.getSearchPairYear({ publishTime: 'not-a-date' }), null);
+  //   assert.equal(source.getSearchPairYear({ publishTime: 253402300800000 }), null);
+
+  //   assert.equal(source.isMergeableSearchPair(
+  //     { name: '千禧剧', publishTime: 974788882000 },
+  //     { name: '千禧剧', publishTime: 974820151000 },
+  //   ), true);
   // });
 
   // await t.test('GET hanjutv search', async () => {
@@ -782,4 +1881,93 @@ test('worker.js API endpoints', async (t) => {
   //   const res = await handler.deploy();
   //   assert(res, `Expected res is true, but got ${res}`);
   // });
+
+  // // 测试 Bangumi Data 本地检索功能与数据结构解析
+  // await t.test('searchBangumiData', async () => {
+  //   const originalUseBangumiData = Globals.getConfig().useBangumiData;
+  //   Globals.getConfig().useBangumiData = true;
+  //   try {
+  //     // 确保 Bangumi Data 核心数据源加载至内存
+  //     await initBangumiData('node', true);
+  //     const keyword = '间谍过家家';
+  //     const targetSites = ['gamer', 'gamer_hk'];
+  //     // 执行本地内存级检索
+  //     const results = await searchBangumiData(keyword, targetSites);
+  //     assert(Array.isArray(results), `Expected Array.isArray(results) to be true, but got ${typeof results}`);
+  //     assert(results.length > 0, `Expected results.length > 0, but got ${results.length}`);
+  //     if (results.length > 0) {
+  //       assert(results[0].title !== undefined, `Expected results[0].title !== undefined`);
+  //       assert(results[0].siteId !== undefined, `Expected results[0].siteId !== undefined`);
+  //     }
+  //   } finally {
+  //     clearBangumiDataCache();
+  //     Globals.getConfig().useBangumiData = originalUseBangumiData;
+  //   }
+  // });
+
+  // // 测试带有季度参数的精确拦截与检索机制
+  // await t.test('searchAnimeWithSeason', async () => {
+  //   const config = Globals.getConfig();
+  //   const originalSourceOrderArr = Array.isArray(config.sourceOrderArr) ? [...config.sourceOrderArr] : config.sourceOrderArr;
+  //   config.sourceOrderArr = ['360','iqiyi','dandan','animeko'];
+  //   try {
+  //     // 构造带有 season 参数的 URL 请求对象以模拟 match 接口的内部下发
+  //     const targetUrl = new URL('http://localhost/search/anime?keyword=间谍过家家&season=2');
+  //     const response = await searchAnime(targetUrl);
+  //     const data = await parseResponse(response);
+  //     assert.equal(data.success, true);
+  //     assert(Array.isArray(data.animes), `Expected Array.isArray(data.animes) to be true`);
+  //     assert(data.animes.length > 0, `Expected data.animes.length > 0, but got ${data.animes.length}`);
+  //   } finally {
+  //     config.sourceOrderArr = originalSourceOrderArr;
+  //   }
+  // });
+
 });
+
+// // 测试本地 Redis 功能
+// test('local-redis functions', async (t) => {
+//   // 测试设置和获取本地 Redis 键值
+//   await t.test('setLocalRedisKey and getLocalRedisKey', async () => {
+//     try {
+//       const testKey = 'test_key_local_redis';
+//       const testValue = 'Hello Local Redis';
+
+//       // 设置键值
+//       const setResult = await setLocalRedisKey(testKey, testValue);
+//       // 验证设置结果
+//       assert.ok(setResult.result === 'OK' || setResult.result === 'ERROR', 
+//         `setLocalRedisKey returned valid result: ${JSON.stringify(setResult)}`);
+
+//       // 获取键值
+//       const getResult = await getLocalRedisKey(testKey);
+//       // 验证获取结果（如果 Redis 不可用，可能返回 null）
+//       if (getResult !== null) {
+//         // 如果返回了结果，验证它是否是我们设置的值（可能是序列化的）
+//         assert.ok(typeof getResult === 'string' || getResult === null, 
+//           `getLocalRedisKey returned expected type: ${typeof getResult}`);
+//       } else {
+//         // 如果返回 null，也是可以接受的（表示 Redis 不可用）
+//         assert.strictEqual(getResult, null, 'getLocalRedisKey returned null when Redis is not available');
+//       }
+//     } catch (error) {
+//       assert.ok(true, `setLocalRedisKey/getLocalRedisKey handled error gracefully: ${error.message}`);
+//     }
+//   });
+
+//   // 测试设置带过期时间的本地 Redis 键值
+//   await t.test('setLocalRedisKeyWithExpiry', async () => {
+//     try {
+//       const testKey = 'test_expiry_key_local_redis';
+//       const testValue = 'Temporary Value';
+//       const expirySeconds = 2; // 2秒过期
+
+//       const setResult = await setLocalRedisKeyWithExpiry(testKey, testValue, expirySeconds);
+//       // 验证设置结果
+//       assert.ok(setResult.result === 'OK' || setResult.result === 'ERROR', 
+//         `setLocalRedisKeyWithExpiry returned valid result: ${JSON.stringify(setResult)}`);
+//     } catch (error) {
+//       assert.ok(true, `setLocalRedisKeyWithExpiry handled error gracefully: ${error.message}`);
+//     }
+//   });
+// });

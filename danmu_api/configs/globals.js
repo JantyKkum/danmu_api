@@ -13,9 +13,8 @@ export const Globals = {
   accessedEnvVars: {},
 
   // 静态常量
-  VERSION: '1.15.1',
+  VERSION: '1.20.0',
   MAX_LOGS: 1000, // 日志存储，最多保存 1000 行
-  MAX_ANIMES: 100,
   MAX_RECORDS: 100, // 请求记录最大数量
 
   // 运行时状态
@@ -27,6 +26,7 @@ export const Globals = {
   localCacheValid: false, // 本地缓存是否生效
   localCacheInitialized: false, // 本地缓存是否已初始化
   redisValid: false, // redis是否生效
+  localRedisValid: false, // 本地redis是否生效
   aiValid: false, // AI配置是否生效
   redisCacheInitialized: false, // redis 缓存是否已初始化
   lastSelectMap: new Map(), // 存储查询关键字上次选择的animeId，用于下次match自动匹配时优先选择该anime
@@ -105,6 +105,9 @@ export const Globals = {
       } else if (conf.startsWith('bilibili@') && hostname.includes('bilibili')) {
          specificProxy = conf.substring(9);
          break;
+      } else if (conf.startsWith('animeko@') && (hostname.includes('animeko') || hostname.includes('bgm.tv'))) {
+         specificProxy = conf.substring(8);
+         break;
       } else if (conf.startsWith('@') && !universalProxy) {
          universalProxy = conf.substring(1);
       } else if (!conf.includes('@') && !forwardProxy) {
@@ -149,12 +152,14 @@ export const Globals = {
    */
   /**
    * 获取全局配置对象（单例，可修改）
+   * 使用 Proxy 保持接口兼容性，实例懒初始化后缓存复用避免每次新建
    * @returns {Object} 全局配置对象本身
    */
   getConfig() {
-    // 使用 Proxy 保持接口兼容性
+    if (this._configProxy) return this._configProxy;
+
     const self = this;
-    return new Proxy({}, {
+    this._configProxy = new Proxy({}, {
       get(target, prop) {
         // 优先返回 envs 中的属性（保持原有的平铺效果）
         if (prop in self.envs) {
@@ -163,7 +168,7 @@ export const Globals = {
         // 映射大写常量到小写
         if (prop === 'version') return self.VERSION;
         if (prop === 'maxLogs') return self.MAX_LOGS;
-        if (prop === 'maxAnimes') return self.MAX_ANIMES;
+        if (prop === 'maxAnimes') return self.envs.MAX_ANIMES;
         if (prop === 'maxRecords') return self.MAX_RECORDS;
         if (prop === 'maxLastSelectMap') return self.MAX_LAST_SELECT_MAP;
 
@@ -183,6 +188,8 @@ export const Globals = {
         return true;
       }
     });
+
+    return this._configProxy;
   },
 };
 
